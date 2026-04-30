@@ -1,0 +1,113 @@
+import pandas as pd
+import statsmodels.api as sm
+from itertools import combinations
+from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
+
+# ===============================
+# 1. LOAD DATA
+# ===============================
+file_path = "Data ODR & MEV.xlsx"
+odr_data = pd.read_excel(file_path, sheet_name="ODR", header=0, index_col=0)
+mev_data = pd.read_excel(file_path, sheet_name="MEV", header=0, index_col=0)
+mev_pred_data = pd.read_excel(file_path, sheet_name="MEV Prediction", header=0, index_col=0)
+
+# ===============================
+# 2. IDENTIFIKASI MEV SIGNIFIKAN PER SEKTOR
+# ===============================
+mev_signif_dict = {}
+alpha = 0.05
+
+for sektor in odr_data.columns:
+    y = odr_data[sektor].reset_index(drop=True)
+    signif_mev = []
+    for col in mev_data.columns:
+        X = sm.add_constant(mev_data[[col]].reset_index(drop=True))
+        model = sm.GLM(y, X, family=sm.families.Gaussian()).fit()
+        if model.pvalues[col] < alpha:
+            signif_mev.append(col)
+    mev_signif_dict[sektor] = signif_mev
+
+# ===============================
+# 3. SEARCH BEST COMBINATION OF MEV
+# ===============================
+best_combination_dict = {}
+metrics_list = []
+predicted_train = pd.DataFrame(index=odr_data.index)
+
+for sektor in odr_data.columns:
+    y = odr_data[sektor].reset_index(drop=True)
+    lag_odr = y.shift(1).fillna(y.iloc[0])
+    trend = pd.Series(range(len(y)))
+    
+    best_rmse = np.inf
+    best_combo = None
+    
+    for r in range(1, len(mev_signif_dict[sektor])+1):
+        for combo in combinations(mev_signif_dict[sektor], r):
+            X_combo = mev_data[list(combo)].reset_index(drop=True)
+            X_combo["lag_odr"] = lag_odr
+            X_combo["trend"] = trend
+            X_combo = sm.add_constant(X_combo)
+            
+            model = sm.GLM(y, X_combo, family=sm.families.Gaussian()).fit()
+            y_pred = model.predict(X_combo)
+            
+            rmse = np.sqrt(mean_squared_error(y, y_pred))
+            r2 = r2_score(y, y_pred)
+            
+            metrics_list.append({
+                "Sektor": sektor,
+                "MEV_Combo": combo,
+                "RMSE": rmse,
+                "R2": r2
+            })
+            
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best_combo = combo
+                best_model = model
+                best_y_pred = y_pred
+    
+    best_combination_dict[sektor] = {"combo": best_combo, "model": best_model}
+    predicted_train[sektor] = best_y_pred
+
+# ===============================
+# 4. FORECAST TESTING
+# ===============================
+forecast = pd.DataFrame(index=mev_pred_data.index)
+
+for sektor in odr_data.columns:
+    last_odr = odr_data[sektor].iloc[-1]
+    y_forecast = []
+    model = best_combination_dict[sektor]["model"]
+    combo = best_combination_dict[sektor]["combo"]
+    
+    for i in range(len(mev_pred_data)):
+        trend_val = len(odr_data) + i
+        lag_val = last_odr
+        
+        Xf = pd.DataFrame(index=[0])
+        for col in combo:
+            Xf[col] = [mev_pred_data[col].iloc[i]]
+        Xf["lag_odr"] = [lag_val]
+        Xf["trend"] = [trend_val]
+        Xf = sm.add_constant(Xf)
+        
+        y_pred_val = model.predict(Xf)[0]
+        y_forecast.append(y_pred_val)
+        last_odr = y_pred_val
+    
+    forecast[sektor] = y_forecast
+
+# ===============================
+# 5. SIMPAN METRICS & FORECAST KE EXCEL
+# ===============================
+metrics_df = pd.DataFrame(metrics_list)
+
+with pd.ExcelWriter("Hasil_Best_Combination_ODR.xlsx", engine="xlsxwriter") as writer:
+    odr_data.to_excel(writer, sheet_name="ODR")
+    mev_data.to_excel(writer, sheet_name="MEV")
+    metrics_df.to_excel(writer, sheet_name="Metrics Training", index=False)
+    predicted_train.to_excel(writer, sheet_name="Actual vs Predicted", index=True)
+    forecast.to_excel(writer, sheet_name="Forecast Testing", index=True)
